@@ -1,0 +1,41 @@
+name: "Build Release Container"
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+jobs:
+  build-container:
+    name: "Build Container"
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Catch Meta Info
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ghcr.io/ReanSn0w/go-udp-proxy
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+      - name: Login to Regestry
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ReanSn0w
+          password: ${{ secrets.GCRT }}
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          push: true
+          context: .
+          file: ./Dockerfile
+          tags: ${{steps.meta.outputs.tags}}
+          labels: ${{steps.meta.outputs.labels}}
+          build-args: |
+            TAG=${{ github.ref_name }}
