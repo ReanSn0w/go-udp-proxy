@@ -3,7 +3,6 @@ package proxy
 import (
 	"context"
 	"fmt"
-	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -13,11 +12,17 @@ import (
 
 const SOL_UDP = 17 // Linux
 
+type readResult struct {
+	n   int
+	err error
+}
+
 type Options struct {
 	BufferSize       int  `long:"buffer-size" env:"BUFFER_SIZE" default:"65507" description:"Максимальный размер UDP пакета"`
 	ReadDeadline     int  `long:"read-deadline" env:"READ_DEADLINE" default:"100" description:"Время ожидания ответа, мс"`
 	CleanupInterval  int  `long:"cleanup-interval" env:"CLEANUP_INTERVAL" default:"30" description:"Интервал закрытия неактивных соединений, c"`
 	InactiveTimeout  int  `long:"inactive-timeout" env:"INACTIVE_TIMEOUT" default:"5" description:"Время по прошествии которого клиент считается неактивным, м"`
+	StatsInterval    int  `long:"stats-interval" env:"STATS_INTERVAL" default:"30" description:"Интервал вывода статистики, c"`
 	WorkerCount      int  `long:"worker-count" env:"WORKER_COUNT" default:"0" description:"Количество рабочих (0 = автоматически)"`
 	MaxConnections   int  `long:"max-connections" env:"MAX_CONNECTIONS" default:"10000" description:"Максимальное количество одновременных соединений"`
 	SocketBufferSize int  `long:"socket-buffer-size" env:"SOCKET_BUFFER_SIZE" default:"4194304" description:"Размер UDP socket buffer (4MB)"`
@@ -41,6 +46,7 @@ type Server struct {
 	// Graceful shutdown
 	done         chan struct{}
 	shutdownOnce sync.Once
+	shutdownCh   chan struct{}
 
 	// Статистика
 	packetsProcessed atomic.Int64
@@ -87,6 +93,18 @@ func NewServer(
 	if opts.SocketBufferSize <= 0 {
 		opts.SocketBufferSize = 4 * 1024 * 1024
 	}
+	if opts.CleanupInterval <= 0 {
+		opts.CleanupInterval = 30
+	}
+	if opts.InactiveTimeout <= 0 {
+		opts.InactiveTimeout = 5
+	}
+	if opts.ReadDeadline <= 0 {
+		opts.ReadDeadline = 100
+	}
+	if opts.StatsInterval <= 0 {
+		opts.StatsInterval = 30
+	}
 
 	return &Server{
 		opts:       opts,
@@ -99,11 +117,13 @@ func NewServer(
 		clients:    make(map[string]*clientConn),
 		logger:     logger,
 		done:       make(chan struct{}),
+		shutdownCh: make(chan struct{}), // ✅
 	}
 }
 
 // Start запускает UDP прокси сервер
 func (s *Server) Start(ctx context.Context) error {
+	s.logger.Logf("[DEBUG] Start: begin")
 	listenAddr, err := net.ResolveUDPAddr("udp", s.listenAddr)
 	if err != nil {
 		return fmt.Errorf("failed to resolve listen address: %w", err)
@@ -113,27 +133,52 @@ func (s *Server) Start(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to listen on UDP: %w", err)
 	}
-	defer s.closeConnection()
 
 	if err := s.optimizeListenSocket(); err != nil {
 		s.logger.Logf("[WARN] Failed to optimize listen socket: %v", err)
 	}
 
 	s.logger.Logf("[INFO] UDP Proxy started on %s -> %s", s.listenAddr, s.targetAddr)
-	s.logger.Logf("[INFO] Workers: %d | Buffer: %d bytes | Socket buffer: %d bytes",
-		s.opts.WorkerCount, s.opts.BufferSize, s.opts.SocketBufferSize)
 
-	go s.cleanupConnections(ctx)
-	go s.statsLogger(ctx)
+	bgCtx, bgCancel := context.WithCancel(context.Background())
+	defer bgCancel()
 
-	go func() {
-		<-ctx.Done()
-		if s.conn != nil {
-			s.conn.Close()
-		}
-	}()
+	go s.cleanupConnections(bgCtx)
+	go s.statsLogger(bgCtx)
 
-	return s.handlePackets(ctx)
+	s.logger.Logf("[DEBUG] Start: calling handlePackets")
+	err = s.handlePackets(ctx)
+	s.logger.Logf("[DEBUG] Start: handlePackets returned: %v", err)
+
+	s.logger.Logf("[DEBUG] Start: closing connection immediately")
+	s.closeConnection()
+	s.logger.Logf("[DEBUG] Start: closeConnection() returned")
+
+	s.logger.Logf("[DEBUG] Start: waiting for all clients to finish")
+
+	s.mu.RLock()
+	clients := make([]*clientConn, 0, len(s.clients))
+	for _, client := range s.clients {
+		clients = append(clients, client)
+	}
+	s.mu.RUnlock()
+
+	for i, client := range clients {
+		s.logger.Logf("[DEBUG] Start: cancelling client %d", i)
+		client.cancel()
+	}
+
+	for i, client := range clients {
+		s.logger.Logf("[DEBUG] Start: waiting for client %d", i)
+		client.wg.Wait()
+		s.logger.Logf("[DEBUG] Start: client %d done", i)
+	}
+
+	s.logger.Logf("[DEBUG] Start: all clients finished")
+	s.Stop()
+	s.logger.Logf("[DEBUG] Start: Stop() returned")
+
+	return err
 }
 
 // optimizeListenSocket оптимизирует параметры UDP сокета
@@ -193,47 +238,80 @@ func (s *Server) optimizeTargetSocket(conn *net.UDPConn) error {
 
 // handlePackets обрабатывает входящие UDP пакеты
 func (s *Server) handlePackets(ctx context.Context) error {
+	s.logger.Logf("[DEBUG] handlePackets started")
 	buffer := make([]byte, s.opts.BufferSize)
+	readDeadline := time.Duration(s.opts.ReadDeadline) * time.Millisecond
 
 	for {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			s.logger.Logf("[DEBUG] handlePackets ctx.Done (main loop)")
+			return nil
+		case <-s.shutdownCh:
+			s.logger.Logf("[DEBUG] handlePackets shutdownCh (main loop)")
+			return nil
 		default:
 		}
 
-		n, clientAddr, err := s.conn.ReadFromUDP(buffer)
-		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		s.logger.Logf("[DEBUG] handlePackets before ReadFromUDP")
+
+		// ✅ Обернуть ReadFromUDP в горутину с timeout
+		type readPacketResult struct {
+			n    int
+			addr *net.UDPAddr
+			err  error
+		}
+
+		readCh := make(chan readPacketResult, 1)
+		go func() {
+			s.conn.SetReadDeadline(time.Now().Add(readDeadline))
+			n, clientAddr, err := s.conn.ReadFromUDP(buffer)
+			readCh <- readPacketResult{n: n, addr: clientAddr, err: err}
+		}()
+
+		// ✅ Ждем результата или отмены контекста
+		select {
+		case <-ctx.Done():
+			s.logger.Logf("[DEBUG] handlePackets ctx.Done (during read)")
+			return nil
+		case <-s.shutdownCh:
+			s.logger.Logf("[DEBUG] handlePackets shutdownCh (during read)")
+			return nil
+		case result := <-readCh:
+			s.logger.Logf("[DEBUG] handlePackets after ReadFromUDP: n=%d, err=%v", result.n, result.err)
+
+			if result.err != nil {
+				if netErr, ok := result.err.(net.Error); ok && netErr.Timeout() {
+					s.logger.Logf("[DEBUG] handlePackets timeout, continuing")
+					continue
+				}
+				s.logger.Logf("[DEBUG] handlePackets error: %v, returning", result.err)
+				return nil
+			}
+
+			s.packetsProcessed.Add(1)
+			s.bytesForwarded.Add(int64(result.n))
+
+			client, err := s.getOrCreateClient(ctx, result.addr)
+			if err != nil {
+				s.logger.Logf("[WARN] Error getting client: %v", err)
 				continue
 			}
+
+			dataCopy := make([]byte, result.n)
+			copy(dataCopy, buffer[:result.n])
+
 			select {
+			case client.sendQueue <- dataCopy:
 			case <-ctx.Done():
+				s.logger.Logf("[DEBUG] handlePackets ctx.Done (during send)")
+				return nil
+			case <-s.shutdownCh:
+				s.logger.Logf("[DEBUG] handlePackets shutdownCh (during send)")
 				return nil
 			default:
-				s.logger.Logf("[ERROR] Error reading UDP packet: %v", err)
-				return err
+				s.packetDropped.Add(1)
 			}
-		}
-
-		s.packetsProcessed.Add(1)
-		s.bytesForwarded.Add(int64(n))
-
-		client, err := s.getOrCreateClient(ctx, clientAddr)
-		if err != nil {
-			s.logger.Logf("[WARN] Error getting client: %v", err)
-			continue
-		}
-
-		dataCopy := make([]byte, n)
-		copy(dataCopy, buffer[:n])
-
-		select {
-		case client.sendQueue <- dataCopy:
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-			s.packetDropped.Add(1)
 		}
 	}
 }
@@ -288,28 +366,45 @@ func (s *Server) getOrCreateClient(ctx context.Context, clientAddr *net.UDPAddr)
 	count := len(s.clients)
 	s.mu.Unlock()
 
-	s.activeClients.Store(int32(count))
+	s.activeClients.Add(1)
 	s.logger.Logf("[DEBUG] New client: %s (total: %d)", clientAddr, count)
 
 	client.wg.Add(2)
 	go s.forwardToTargetWorker(ctx, client, clientKey)
 	go s.forwardFromTarget(clientCtx, client, clientKey)
 
+	// ✅ ДОБАВИТЬ: Горутина для закрытия соединения при отмене контекста
+	go func() {
+		<-clientCtx.Done()
+		s.logger.Logf("[DEBUG] clientCtx.Done, closing targetConn: %s", clientKey)
+		if client.targetConn != nil {
+			client.targetConn.Close()
+		}
+	}()
+
 	return client, nil
 }
 
 // forwardToTargetWorker отправляет пакеты на целевой сервер
 func (s *Server) forwardToTargetWorker(ctx context.Context, client *clientConn, clientKey string) {
-	defer client.wg.Done()
+	s.logger.Logf("[DEBUG] forwardToTargetWorker started: %s", clientKey)
+	defer func() {
+		s.logger.Logf("[DEBUG] forwardToTargetWorker finished: %s", clientKey)
+		client.wg.Done()
+		s.activeClients.Add(-1)
+	}()
 
 	for {
 		select {
 		case <-ctx.Done():
+			s.logger.Logf("[DEBUG] forwardToTargetWorker ctx.Done: %s", clientKey)
 			return
 		case <-client.done:
+			s.logger.Logf("[DEBUG] forwardToTargetWorker client.done: %s", clientKey)
 			return
 		case data, ok := <-client.sendQueue:
 			if !ok {
+				s.logger.Logf("[DEBUG] forwardToTargetWorker sendQueue closed: %s", clientKey)
 				return
 			}
 			if _, err := client.targetConn.Write(data); err != nil {
@@ -324,51 +419,108 @@ func (s *Server) forwardToTargetWorker(ctx context.Context, client *clientConn, 
 // forwardFromTarget получает ответы от целевого сервера
 func (s *Server) forwardFromTarget(ctx context.Context, client *clientConn, clientKey string) {
 	defer func() {
+		if r := recover(); r != nil {
+			s.logger.Logf("[ERROR] forwardFromTarget panic: %v (%s)", r, clientKey)
+		}
+		s.logger.Logf("[DEBUG] forwardFromTarget defer: closing resources")
 		client.wg.Done()
-		client.targetConn.Close()
+
+		if client.targetConn != nil {
+			client.targetConn.Close()
+		}
+
+		defer func() {
+			if r := recover(); r != nil {
+				s.logger.Logf("[DEBUG] Panic closing sendQueue: %v", r)
+			}
+		}()
 		close(client.sendQueue)
 
 		s.mu.Lock()
 		delete(s.clients, clientKey)
-		count := len(s.clients)
 		s.mu.Unlock()
 
-		s.activeClients.Store(int32(count))
+		s.activeClients.Add(-1)
+
+		defer func() {
+			if r := recover(); r != nil {
+				s.logger.Logf("[DEBUG] Panic closing done: %v", r)
+			}
+		}()
 		close(client.done)
+
+		s.logger.Logf("[DEBUG] forwardFromTarget finished: %s", clientKey)
 	}()
 
+	s.logger.Logf("[DEBUG] forwardFromTarget beginning loop: %s", clientKey)
 	buffer := make([]byte, s.opts.BufferSize)
-	readDeadline := time.Duration(s.opts.ReadDeadline) * time.Millisecond
 
 	for {
+		// ✅ Проверка контекста
 		select {
 		case <-ctx.Done():
+			s.logger.Logf("[DEBUG] forwardFromTarget ctx.Done: %s", clientKey)
 			return
 		case <-client.done:
+			s.logger.Logf("[DEBUG] forwardFromTarget client.done: %s", clientKey)
 			return
 		default:
 		}
 
-		client.targetConn.SetReadDeadline(time.Now().Add(readDeadline))
-		n, err := client.targetConn.Read(buffer)
+		s.logger.Logf("[DEBUG] forwardFromTarget before Read: %s", clientKey)
 
-		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				continue
-			}
-			if err != io.EOF {
-				s.logger.Logf("[DEBUG] Read error: %v", err)
-			}
+		// ✅ Обернуть Read в горутину с timeout
+		readCh := make(chan readResult, 1)
+		go func() {
+			client.targetConn.SetReadDeadline(time.Now().Add(5 * time.Millisecond))
+			n, err := client.targetConn.Read(buffer)
+			readCh <- readResult{n: n, err: err}
+		}()
+
+		// ✅ Ждем результата Read или отмены контекста
+		select {
+		case <-ctx.Done():
+			s.logger.Logf("[DEBUG] forwardFromTarget ctx.Done (during read): %s", clientKey)
 			return
-		}
-
-		_, err = s.conn.WriteToUDP(buffer[:n], client.addr)
-		if err != nil {
-			s.logger.Logf("[WARN] Write error: %v", err)
+		case <-client.done:
+			s.logger.Logf("[DEBUG] forwardFromTarget client.done (during read): %s", clientKey)
 			return
-		}
+		case result := <-readCh:
+			s.logger.Logf("[DEBUG] forwardFromTarget after Read (n=%d, err=%v): %s", result.n, result.err, clientKey)
 
-		client.lastSeen = time.Now()
+			if result.err != nil {
+				if netErr, ok := result.err.(net.Error); ok && netErr.Timeout() {
+					s.logger.Logf("[DEBUG] forwardFromTarget timeout: %s", clientKey)
+					continue
+				}
+				s.logger.Logf("[DEBUG] forwardFromTarget read error: %v (%s)", result.err, clientKey)
+				return
+			}
+
+			if s.conn == nil {
+				s.logger.Logf("[DEBUG] forwardFromTarget s.conn is nil: %s", clientKey)
+				return
+			}
+
+			// ✅ Проверка контекста перед write
+			select {
+			case <-ctx.Done():
+				s.logger.Logf("[DEBUG] forwardFromTarget ctx.Done (before write): %s", clientKey)
+				return
+			case <-client.done:
+				s.logger.Logf("[DEBUG] forwardFromTarget client.done (before write): %s", clientKey)
+				return
+			default:
+			}
+
+			_, err := s.conn.WriteToUDP(buffer[:result.n], client.addr)
+			if err != nil {
+				s.logger.Logf("[DEBUG] forwardFromTarget write error: %v (%s)", err, clientKey)
+				return
+			}
+
+			client.lastSeen = time.Now()
+		}
 	}
 }
 
@@ -413,7 +565,7 @@ func (s *Server) cleanupInactiveClients() {
 
 // statsLogger выводит статистику
 func (s *Server) statsLogger(ctx context.Context) {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(time.Duration(s.opts.StatsInterval) * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -426,8 +578,8 @@ func (s *Server) statsLogger(ctx context.Context) {
 			active := s.activeClients.Load()
 			dropped := s.packetDropped.Load()
 
-			throughput := float64(forwarded) / 30.0 / 1024 / 1024
-			pps := processed / 30
+			throughput := float64(forwarded) / time.Duration(s.opts.StatsInterval).Seconds() / 1024 / 1024
+			pps := processed / int64(s.opts.StatsInterval)
 
 			s.logger.Logf("[STATS] PPS: %d | Throughput: %.2f MB/s | Clients: %d | Dropped: %d",
 				pps, throughput, active, dropped)
@@ -437,37 +589,40 @@ func (s *Server) statsLogger(ctx context.Context) {
 
 // closeConnection закрывает соединение
 func (s *Server) closeConnection() {
+	s.logger.Logf("[DEBUG] closeConnection: start")
 	if s.conn != nil {
-		if err := s.conn.Close(); err != nil {
-			s.logger.Logf("[WARN] Close error: %v", err)
-		}
+		s.logger.Logf("[DEBUG] closeConnection: closing conn")
+		conn := s.conn
+		s.conn = nil
+
+		// ✅ Закрыть в фоновой горутине без ожидания
+		go func() {
+			s.logger.Logf("[DEBUG] closeConnection: bg goroutine closing")
+			conn.Close()
+			s.logger.Logf("[DEBUG] closeConnection: bg goroutine done")
+		}()
 	}
+	s.logger.Logf("[DEBUG] closeConnection: finished (not waiting)")
 }
 
 // Stop останавливает сервер
 func (s *Server) Stop() {
+	s.logger.Logf("[DEBUG] Stop: entering")
 	s.shutdownOnce.Do(func() {
-		s.logger.Logf("[INFO] Stopping server...")
+		s.logger.Logf("[DEBUG] Stop: inside Do")
 
-		s.closeConnection()
+		select {
+		case <-s.shutdownCh:
+		default:
+			close(s.shutdownCh)
+		}
 
 		s.mu.Lock()
-		clients := make([]*clientConn, 0, len(s.clients))
-		for _, client := range s.clients {
-			clients = append(clients, client)
-		}
 		s.clients = make(map[string]*clientConn)
 		s.mu.Unlock()
 
-		for _, client := range clients {
-			client.cancel()
-		}
-
-		for _, client := range clients {
-			client.wg.Wait()
-		}
-
 		close(s.done)
+		s.logger.Logf("[DEBUG] Stop: finished")
 	})
 }
 
