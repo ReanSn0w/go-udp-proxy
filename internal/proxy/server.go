@@ -26,7 +26,7 @@ type Options struct {
 	WorkerCount      int  `long:"worker-count" env:"WORKER_COUNT" default:"0" description:"Количество рабочих (0 = автоматически)"`
 	MaxConnections   int  `long:"max-connections" env:"MAX_CONNECTIONS" default:"10000" description:"Максимальное количество одновременных соединений"`
 	SocketBufferSize int  `long:"socket-buffer-size" env:"SOCKET_BUFFER_SIZE" default:"4194304" description:"Размер UDP socket buffer (4MB)"`
-	EnableGRO        bool `long:"enable-gro" env:"ENABLE_GRO" default:"false" description:"Включить Generic Receive Offload"`
+	EnableGRO        bool `long:"disable-gro" env:"DISABLE_GRO" description:"Отключить Generic Receive Offload"`
 }
 
 // Server представляет UDP прокси сервер
